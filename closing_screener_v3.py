@@ -1,11 +1,11 @@
 """
-[보강판] 종가매매 실전 스크리너 & Gmail 자동 알림 (전략 3 최적화)
+[보강판] 종가매매 실전 스크리너 & Gmail 자동 알림 (전략 3 최적화 & 다중 수신자 지원)
 - PyKrx + 네이버 금융 크롤러 기반 (증권사 API 키 불필요, 100% 무료)
 - 거래대금 300억~500억 이상 주도주 선별
 - 당일 상승률 +3% ~ +15% (과열주 제외)
 - 윗꼬리 ≤ 2.0% 이내 (종가 고가형 캔들)
 - 전일 고가 돌파, 5/20선 정배열, 거래량 200%↑
-- GitHub Actions / 클라우드 서버리스 환경 완벽 호환
+- GitHub Actions 다중 이메일 수신자(쉼표 구분) 완벽 지원
 """
 
 import os
@@ -23,7 +23,7 @@ from email.mime.text import MIMEText
 # 환경변수 (GitHub Secrets에서 주입)
 GMAIL_USER = os.getenv("GMAIL_USER", "").strip()
 GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD", "").strip()
-TARGET_EMAIL = os.getenv("TARGET_EMAIL", GMAIL_USER).strip()
+TARGET_EMAIL_RAW = os.getenv("TARGET_EMAIL", GMAIL_USER).strip()
 
 # 전략 3 보강 최적화 기준값
 MIN_TRADE_AMOUNT = 300_0000_0000  # 최소 거래대금 (300억 원)
@@ -40,7 +40,6 @@ def get_naver_top_stocks():
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
 
-    # 1. 거래량 상위 (코스피=0, 코스닥=1) 및 상승률 상위
     urls = [
         "https://finance.naver.com/sise/sise_quant.naver?sosok=0",
         "https://finance.naver.com/sise/sise_quant.naver?sosok=1",
@@ -48,15 +47,12 @@ def get_naver_top_stocks():
         "https://finance.naver.com/sise/sise_rise.naver?sosok=1",
     ]
 
-    pattern = re.compile(r'<a href="/item/main\.naver\?code=(\d{6})"[^>]*class="tltle"[^>]*>([^<]+)</a>')
-
     for url in urls:
         try:
             res = requests.get(url, headers=headers, timeout=10)
             res.encoding = 'euc-kr'
             html = res.text
 
-            # tr 단위 파싱
             from bs4 import BeautifulSoup
             soup = BeautifulSoup(html, 'html.parser')
             rows = soup.select('table.type_2 tr')
@@ -72,12 +68,9 @@ def get_naver_top_stocks():
                 if len(tds) >= 4:
                     try:
                         curr_price = float(tds[0].text.strip().replace(',', ''))
-                        # 등락률 파싱
                         change_text = tds[2].text.strip().replace('%', '').replace('+', '').replace('\n', '').replace('\t', '')
                         change_rate = float(change_text)
                         volume = float(tds[3].text.strip().replace(',', ''))
-                        
-                        # 거래대금 추정 (단가 * 거래량)
                         est_amount = curr_price * volume
 
                         if code not in stocks:
@@ -136,11 +129,9 @@ def evaluate_candidate(stock):
     trade_amt = stock['trade_amt']
     change_rate = stock['change_rate']
 
-    # 1. 1차 필터링: 거래대금 300억 이상 & 상승률 +3% ~ +15% (과열 급등주 제외)
     if trade_amt < MIN_TRADE_AMOUNT or not (MIN_CHANGE_RATE <= change_rate <= MAX_CHANGE_RATE):
         return None
 
-    # 2. 일봉 데이터 조회
     bars = fetch_daily_ohlcv_naver(code, count=35)
     if len(bars) < 22:
         return None
@@ -154,21 +145,17 @@ def evaluate_candidate(stock):
     prev_high = prev_bar['high']
     prev_vol = prev_bar['volume']
 
-    # 3. 윗꼬리(고가 대비 밀림) ≤ 2.0% 이내 엄수
     pullback_pct = ((today_high - curr_price) / today_high * 100) if today_high > 0 else 999
     if pullback_pct > MAX_PULLBACK:
         return None
 
-    # 4. 전일 고가 상향 돌파 여부
     if curr_price <= prev_high:
         return None
 
-    # 5. 전일 대비 거래량 200%(2배) 이상
     vol_ratio = (today_vol / prev_vol * 100) if prev_vol > 0 else 0
     if vol_ratio < MIN_VOL_RATIO:
         return None
 
-    # 6. 5일선 / 20일선 정배열
     close_list = [b['close'] for b in bars]
     ma5 = sum(close_list[-5:]) / 5
     ma20 = sum(close_list[-20:]) / 20
@@ -176,11 +163,9 @@ def evaluate_candidate(stock):
     if not (curr_price >= ma5 and curr_price >= ma20 and ma5 >= ma20):
         return None
 
-    # 7. 양봉 마감 필수
     if curr_price <= today_open:
         return None
 
-    # 점수 산출
     score = 8
     if trade_amt >= 500_0000_0000: score += 1
     if vol_ratio >= 250.0: score += 1
@@ -208,10 +193,15 @@ def evaluate_candidate(stock):
 
 
 def send_gmail_report(qualified_stocks):
-    """HTML 결과 리포트를 Gmail로 자동 발송"""
+    """HTML 결과 리포트를 Gmail로 다중 수신자에게 자동 발송"""
     now_str = datetime.now().strftime("%Y년 %m월 %d일 %H:%M")
 
-    print(f"\n📧 Gmail 발송 준비 (발송자: {GMAIL_USER} ➔ 수신자: {TARGET_EMAIL})")
+    # 다중 수신자 파싱 (쉼표 또는 세미콜론으로 구분)
+    target_list = [e.strip() for e in TARGET_EMAIL_RAW.replace(';', ',').split(',') if e.strip()]
+    if not target_list:
+        target_list = [GMAIL_USER]
+
+    print(f"\n📧 Gmail 발송 준비 (발송자: {GMAIL_USER} ➔ 수신자 목록: {', '.join(target_list)})")
 
     if not GMAIL_USER or not GMAIL_APP_PASSWORD:
         print("⚠️ GMAIL_USER 또는 GMAIL_APP_PASSWORD가 설정되지 않았습니다.")
@@ -220,7 +210,7 @@ def send_gmail_report(qualified_stocks):
     msg = MIMEMultipart("alternative")
     msg["Subject"] = f"🚀 [종가매매 추천] {datetime.now().strftime('%m/%d')} 최적 주도주 {len(qualified_stocks)}선 (승률 55.8% 보강전략)"
     msg["From"] = GMAIL_USER
-    msg["To"] = TARGET_EMAIL
+    msg["To"] = ", ".join(target_list)
 
     rows_html = ""
     for idx, s in enumerate(qualified_stocks, 1):
@@ -301,12 +291,12 @@ def send_gmail_report(qualified_stocks):
         server = smtplib.SMTP("smtp.gmail.com", 587)
         server.ehlo()
         server.starttls()
-        # 앱 비밀번호의 공백 제거
         clean_password = GMAIL_APP_PASSWORD.replace(" ", "")
         server.login(GMAIL_USER, clean_password)
-        server.sendmail(GMAIL_USER, TARGET_EMAIL, msg.as_string())
+        # 여러 명에게 동시 발송 (target_list 전달)
+        server.sendmail(GMAIL_USER, target_list, msg.as_string())
         server.quit()
-        print(f"✅ Gmail 발송 성공: {TARGET_EMAIL} ({len(qualified_stocks)}개 추천 종목)")
+        print(f"✅ Gmail 다중 발송 성공: {len(target_list)}명에게 발송됨 ({', '.join(target_list)})")
     except Exception as e:
         print(f"❌ 이메일 발송 실패: {e}")
 
